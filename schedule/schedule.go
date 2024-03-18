@@ -17,14 +17,112 @@ import (
 )
 
 type ScheduleRes struct {
-	flag   uint // 1 for CC , 2 for DAG, 3 for MIS
+	Flag   uint // 1 for CC , 2 for DAG, 3 for MIS
 	cost   uint64
 	txs    []types.Transactions
 	rwsets []accesslist.RWSetList
 	groups [][]uint
 }
 
-func Schedule(txs types.Transactions, predictRwSets []*accesslist.RWSet) (uint, *ScheduleRes) {
+type PipeLineExecutor struct {
+	sch chan *ScheduleRes
+
+	wg sync.WaitGroup // for go-routine
+}
+
+func NewPipeLineExecutor() *PipeLineExecutor {
+	pe := &PipeLineExecutor{
+		sch: make(chan *ScheduleRes, 1000),
+	}
+
+	// pe.wg.Add(1)
+	// go pe.PipeLineExecLoop()
+	return pe
+}
+
+func (pe *PipeLineExecutor) PipeLineSchedule(txs types.Transactions, predictRwSets []*accesslist.RWSet) error {
+	var wg sync.WaitGroup
+	resultCh := make(chan ScheduleRes, 3)
+	wg.Add(3)
+
+	// fmt.Println("CC")
+	go CC(txs, predictRwSets, &wg, resultCh)
+	// fmt.Println("DAG")
+	go DAG(txs, predictRwSets, &wg, resultCh)
+	// fmt.Println("MIS")
+	go MIS(txs, predictRwSets, &wg, resultCh)
+
+	wg.Wait()
+	close(resultCh)
+
+	// 获取调度方案
+	fmt.Println("get result")
+	var minCost uint64 = math.MaxUint64
+	finalRes := new(ScheduleRes)
+	for res := range resultCh {
+		if res.cost < minCost {
+			minCost = res.cost
+			temp := res
+			finalRes = &temp
+		}
+	}
+
+	pe.sch <- finalRes
+
+	return nil
+}
+
+// func (pe *PipeLineExecutor) PipeLineExecLoop() {
+// 	defer pe.wg.Done()
+// 	for {
+// 		select{
+// 		case sr := <-pe.sch
+
+// 		}
+// 	}
+// }
+
+// func (pe *PipeLineExecutor) PipeLineExec(chainDB ethdb.Database, sdbBackend ethState.Database, blockNum uint64) error {
+// 	var wg sync.WaitGroup
+// 	var r sync.Mutex
+
+// 	for i := blockNum; i < blockNum+100; i++ {
+// 		// 1. getTransacion (seq )
+// 		txs, predictRWSet, header, fakeChainCtx := utils.GetTxsPredictsAndHeadersForOneBlock(chainDB, sdbBackend, blockNum)
+// 		// 2. schedule
+// 		st := time.Now()
+// 		sr := Schedule(txs, predictRWSet)
+// 		scheduleTime := time.Since(st)
+// 		pe.sch <- sr
+// 		state, _ := utils.GetState(chainDB, sdbBackend, blockNum)
+
+// 		r.Lock()
+// 		defer r.Unlock()
+
+// 		switch sr.Flag {
+// 		case 1:
+// 			prefetchTime, executeTime, mergeTime, _ := schedule.SCC(sr, header, fakeChainCtx, state)
+// 			totalTime := int64(scheduleTime.Microseconds()) + prefetchTime + executeTime + mergeTime
+// 			fmt.Println("prefetchTime:", prefetchTime, "executeTime:", executeTime, "mergeTime:", mergeTime, "totalTime:", totalTime)
+// 		case 2:
+// 			prefetchTime, executeTime, mergeTime, _ := schedule.SDAG(sr, txs, predictRWSet, header, fakeChainCtx, state)
+// 			totalTime := int64(scheduleTime.Microseconds()) + prefetchTime + executeTime + mergeTime
+// 			fmt.Println("prefetchTime:", prefetchTime, "executeTime:", executeTime, "mergeTime:", mergeTime, "totalTime:", totalTime)
+// 		case 3:
+// 			prefetchTime, executeTime, mergeTime, _ := schedule.SMIS(sr, txs, predictRWSet, header, fakeChainCtx, state)
+// 			totalTime := int64(scheduleTime.Microseconds()) + prefetchTime + executeTime + mergeTime
+// 			fmt.Println("prefetchTime:", prefetchTime, "executeTime:", executeTime, "mergeTime:", mergeTime, "totalTime:", totalTime)
+// 		default:
+// 			panic("flag error")
+// 		}
+
+// 		wg.Done()
+
+// 	}
+// 	return nil
+// }
+
+func Schedule(txs types.Transactions, predictRwSets []*accesslist.RWSet) *ScheduleRes {
 
 	var wg sync.WaitGroup
 	resultCh := make(chan ScheduleRes, 3)
@@ -43,18 +141,16 @@ func Schedule(txs types.Transactions, predictRwSets []*accesslist.RWSet) (uint, 
 	// 获取调度方案
 	fmt.Println("get result")
 	var minCost uint64 = math.MaxUint64
-	var flag uint
 	finalRes := new(ScheduleRes)
 	for res := range resultCh {
 		if res.cost < minCost {
 			minCost = res.cost
-			flag = res.flag
 			temp := res
 			finalRes = &temp
 		}
 	}
 
-	return flag, finalRes
+	return finalRes
 }
 
 // CC 连通分量调度估算
@@ -78,7 +174,7 @@ func CC(txs types.Transactions, predictRwSets []*accesslist.RWSet, wg *sync.Wait
 	fmt.Println("cc maxCost:", maxCost)
 	// 构造返回结构体
 	Res := ScheduleRes{
-		flag:   1,
+		Flag:   1,
 		cost:   maxCost,
 		txs:    txsGroup,
 		rwsets: RWSetsGroup,
@@ -107,7 +203,7 @@ func DAG(txs types.Transactions, predictRwSets []*accesslist.RWSet, wg *sync.Wai
 	fmt.Println("dag maxCost:", maxCost)
 	// 构造返回结构体
 	Res := ScheduleRes{
-		flag:   2,
+		Flag:   2,
 		cost:   maxCost,
 		txs:    nil,
 		rwsets: nil,
@@ -136,7 +232,7 @@ func MIS(txs types.Transactions, predictRwSets []*accesslist.RWSet, wg *sync.Wai
 	fmt.Println("mis maxCost:", maxCost)
 	// 构造返回结构体
 	Res := ScheduleRes{
-		flag:   3,
+		Flag:   3,
 		cost:   maxCost,
 		txs:    nil,
 		rwsets: nil,
@@ -168,7 +264,6 @@ func SCC(sr *ScheduleRes, header *types.Header, fakeChainCtx core.ChainContext, 
 
 	// 预取时间，执行时间，合并时间，总时间
 	return int64(prefectTime.Microseconds()), int64(execTime.Microseconds()), int64(mergeTime.Microseconds()), nil
-
 }
 
 func SDAG(sr *ScheduleRes, txs types.Transactions, predictRwSets accesslist.RWSetList, header *types.Header, fakeChainCtx core.ChainContext, state *ethState.StateDB) (int64, int64, int64, error) {

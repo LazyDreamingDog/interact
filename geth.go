@@ -7,11 +7,13 @@ import (
 	"interact/utils"
 	testfunc "interact/utils/testFunc"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	ethState "github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/panjf2000/ants/v2"
 )
 
 func CC1(chainDB ethdb.Database, sdbBackend ethState.Database, blockNum uint64) error {
@@ -240,11 +242,11 @@ func Schedule(chainDB ethdb.Database, sdbBackend ethState.Database, blockNum uin
 		txs, predictRWSet, header, fakeChainCtx := utils.GetTxsPredictsAndHeadersForOneBlock(chainDB, sdbBackend, blockNum)
 		fmt.Println("start schedule")
 		st := time.Now()
-		flag, sr := schedule.Schedule(txs, predictRWSet)
+		sr := schedule.Schedule(txs, predictRWSet)
 		scheduleTime := time.Since(st)
-		fmt.Println("flag:", flag)
+		fmt.Println("flag:", sr.Flag)
 
-		switch flag {
+		switch sr.Flag {
 		case 1:
 			prefetchTime, executeTime, mergeTime, _ := schedule.SCC(sr, header, fakeChainCtx, state)
 			totalTime := int64(scheduleTime.Microseconds()) + prefetchTime + executeTime + mergeTime
@@ -262,6 +264,62 @@ func Schedule(chainDB ethdb.Database, sdbBackend ethState.Database, blockNum uin
 		}
 	}
 
+}
+
+func pipelineSchedule(chainDB ethdb.Database, sdbBackend ethState.Database, blockNum uint64) error {
+	var wg sync.WaitGroup
+	var r sync.Mutex
+
+	// 准备线程池
+	pool, err := ants.NewPool(8)
+	if err != nil {
+		fmt.Printf("Failed to create pool: %v\n", err)
+		return err
+	}
+
+	for i := blockNum; i < blockNum+100; i++ {
+		wg.Add(1)
+
+		err := pool.Submit(func() {
+			// 1. getTransacion (seq )
+			txs, predictRWSet, header, fakeChainCtx := utils.GetTxsPredictsAndHeadersForOneBlock(chainDB, sdbBackend, blockNum)
+			// 2. schedule
+			st := time.Now()
+			sr := schedule.Schedule(txs, predictRWSet)
+			scheduleTime := time.Since(st)
+
+			state, _ := utils.GetState(chainDB, sdbBackend, blockNum)
+
+			// exec with lock
+			r.Lock()
+			defer r.Unlock()
+
+			switch sr.Flag {
+			case 1:
+				prefetchTime, executeTime, mergeTime, _ := schedule.SCC(sr, header, fakeChainCtx, state)
+				totalTime := int64(scheduleTime.Microseconds()) + prefetchTime + executeTime + mergeTime
+				fmt.Println("prefetchTime:", prefetchTime, "executeTime:", executeTime, "mergeTime:", mergeTime, "totalTime:", totalTime)
+			case 2:
+				prefetchTime, executeTime, mergeTime, _ := schedule.SDAG(sr, txs, predictRWSet, header, fakeChainCtx, state)
+				totalTime := int64(scheduleTime.Microseconds()) + prefetchTime + executeTime + mergeTime
+				fmt.Println("prefetchTime:", prefetchTime, "executeTime:", executeTime, "mergeTime:", mergeTime, "totalTime:", totalTime)
+			case 3:
+				prefetchTime, executeTime, mergeTime, _ := schedule.SMIS(sr, txs, predictRWSet, header, fakeChainCtx, state)
+				totalTime := int64(scheduleTime.Microseconds()) + prefetchTime + executeTime + mergeTime
+				fmt.Println("prefetchTime:", prefetchTime, "executeTime:", executeTime, "mergeTime:", mergeTime, "totalTime:", totalTime)
+			default:
+				panic("flag error")
+			}
+
+			wg.Done()
+		})
+
+		if err != nil {
+			fmt.Printf("Failed to submit task: %v\n", err)
+			break
+		}
+	}
+	return nil
 }
 
 // Aria then cc
